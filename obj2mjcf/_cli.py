@@ -104,6 +104,10 @@ class Args:
     """overwrite previous run output"""
     add_free_joint: bool = False
     """add a free joint to the root body"""
+    remove_errored_mesh: bool = False
+    """(mandi) if compile fails because of qhull error, remove the errored mesh from the MJCF file"""
+    exclude_default: bool = False
+    """(mandi) exclude default mesh from MJCF file"""
 
 
 @dataclass
@@ -410,20 +414,21 @@ def process_obj(filename: Path, args: Args) -> None:
     root = etree.Element("mujoco", model=filename.stem)
 
     # Add visual and collision default classes.
-    default_elem = etree.SubElement(root, "default")
-    visual_default_elem = etree.SubElement(default_elem, "default")
-    visual_default_elem.attrib["class"] = "visual"
-    etree.SubElement(
-        visual_default_elem,
-        "geom",
-        group="2",
-        type="mesh",
-        contype="0",
-        conaffinity="0",
-    )
-    collision_default_elem = etree.SubElement(default_elem, "default")
-    collision_default_elem.attrib["class"] = "collision"
-    etree.SubElement(collision_default_elem, "geom", group="3", type="mesh")
+    if not args.exclude_default:
+        default_elem = etree.SubElement(root, "default")
+        visual_default_elem = etree.SubElement(default_elem, "default")
+        visual_default_elem.attrib["class"] = "visual"
+        etree.SubElement(
+            visual_default_elem,
+            "geom",
+            group="2",
+            type="mesh",
+            contype="0",
+            conaffinity="0",
+        )
+        collision_default_elem = etree.SubElement(default_elem, "default")
+        collision_default_elem.attrib["class"] = "collision"
+        etree.SubElement(collision_default_elem, "geom", group="3", type="mesh")
 
     # Add assets.
     asset_elem = etree.SubElement(root, "asset")
@@ -466,21 +471,44 @@ def process_obj(filename: Path, args: Args) -> None:
     if isinstance(mesh, trimesh.base.Trimesh):
         meshname = Path(f"{filename.stem}.obj")
         # Add the mesh to assets.
-        etree.SubElement(asset_elem, "mesh", file=str(meshname))
+        mesh_asset = etree.SubElement(asset_elem, "mesh", file=str(meshname))
         # Add the geom to the worldbody.
         if process_mtl:
             e_ = etree.SubElement(
                 obj_body, "geom", material=material.name, mesh=str(meshname.stem)
-            )
+            )                
             e_.attrib["class"] = "visual"
         else:
             e_ = etree.SubElement(obj_body, "geom", mesh=meshname.stem)
             e_.attrib["class"] = "visual"
+        
+        if args.compile_model and args.remove_errored_mesh:
+            try:
+                tmp_path = work_dir / f"tmp.xml"
+                tree = etree.ElementTree(root)
+                tree.write(tmp_path, encoding="utf-8")
+                model = mujoco.MjModel.from_xml_path(str(tmp_path))
+                data = mujoco.MjData(model)
+                mujoco.mj_step(model, data)
+                cprint(f"{filename} compiled successfully!", "green")
+            except Exception as e:
+                cprint(f"Error compiling model: {e} - Removing it from BOTH xml and its obj file", "red")
+                # remove this mesh from root 
+                asset_elem.remove(mesh_asset)
+                print('removing! ', e_)
+                obj_body.remove(e_)
+                # remove this mesh's obj file
+                os.remove(work_dir / meshname)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+        # print(obj_body.findall('geom') )
+        # breakpoint()
     else:
         for i, (name, geom) in enumerate(mesh.geometry.items()):
             meshname = Path(f"{filename.stem}_{i}.obj")
             # Add the mesh to assets.
-            etree.SubElement(asset_elem, "mesh", file=str(meshname))
+            asset_i = etree.SubElement(asset_elem, "mesh", file=str(meshname))
             # Add the geom to the worldbody.
             if process_mtl:
                 e_ = etree.SubElement(
@@ -490,6 +518,28 @@ def process_obj(filename: Path, args: Args) -> None:
             else:
                 e_ = etree.SubElement(obj_body, "geom", mesh=meshname.stem)
                 e_.attrib["class"] = "visual"
+            
+            if args.compile_model and args.remove_errored_mesh:
+                # try compile the model
+                try:
+                    tmp_path = work_dir / f"tmp_{i}.xml"
+                    tree = etree.ElementTree(root)
+                    tree.write(tmp_path, encoding="utf-8")
+                    model = mujoco.MjModel.from_xml_path(str(tmp_path))
+                    data = mujoco.MjData(model)
+                    mujoco.mj_step(model, data)
+                    cprint(f"{filename} compiled successfully!", "green")
+                except Exception as e:
+                    cprint(f"Error compiling model: {e} - Removing it from BOTH xml and its obj file", "red")
+                    # remove this mesh from root 
+                    asset_elem.remove(asset_i)
+                    obj_body.remove(e_)
+                    # remove this mesh's obj file
+                    os.remove(work_dir / meshname)
+                finally:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+
 
     # Add collision geoms.
     if decomp_success:
@@ -500,25 +550,61 @@ def process_obj(filename: Path, args: Args) -> None:
         collisions.sort(key=lambda x: int(x.stem.split("_")[-1]))
 
         for collision in collisions:
-            etree.SubElement(asset_elem, "mesh", file=collision.name)
+            collision_asset = etree.SubElement(asset_elem, "mesh", file=collision.name)
             e_ = etree.SubElement(obj_body, "geom", mesh=collision.stem)
             e_.attrib["class"] = "collision"
+
     else:
         # If no decomposed convex hulls were created, use the original mesh as the
         # collision mesh.
         if isinstance(mesh, trimesh.base.Trimesh):
             e_ = etree.SubElement(obj_body, "geom", mesh=meshname.stem)
             e_.attrib["class"] = "collision"
+            if args.compile_model and args.remove_errored_mesh:
+                try:
+                    tmp_path = work_dir / f"tmp_collision.xml"
+                    tree = etree.ElementTree(root)
+                    tree.write(tmp_path, encoding="utf-8")
+                    model = mujoco.MjModel.from_xml_path(str(tmp_path))
+                    data = mujoco.MjData(model)
+                    mujoco.mj_step(model, data)
+                    cprint(f"{filename} compiled successfully!", "green")
+                except Exception as e:
+                    cprint(f"Error compiling model: {e}", "red")
+                    # remove this mesh from root 
+                    obj_body.remove(e_)
+                finally:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+
         else:
             for i, (name, geom) in enumerate(mesh.geometry.items()):
                 meshname = Path(f"{filename.stem}_{i}.obj")
                 e_ = etree.SubElement(obj_body, "geom", mesh=meshname.stem)
                 e_.attrib["class"] = "collision"
+                if args.compile_model and args.remove_errored_mesh:
+                    # try compile the model
+                    try:
+                        tmp_path = work_dir / f"tmp_collision_{i}.xml"
+                        tree = etree.ElementTree(root)
+                        tree.write(tmp_path, encoding="utf-8")
+                        model = mujoco.MjModel.from_xml_path(str(tmp_path))
+                        data = mujoco.MjData(model)
+                        mujoco.mj_step(model, data)
+                        cprint(f"{filename} compiled successfully!", "green")
+                    except Exception as e:
+                        cprint(f"Error compiling model: {e}", "red")
+                        # remove this mesh from root 
+                        obj_body.remove(e_)
+                    finally:
+                        if tmp_path.exists():
+                            tmp_path.unlink()
 
     tree = etree.ElementTree(root)
     etree.indent(tree, space=_XML_INDENTATION, level=0)
 
     # Compile and step the physics to check for any errors.
+    
     if args.compile_model:
         try:
             tmp_path = work_dir / "tmp.xml"
