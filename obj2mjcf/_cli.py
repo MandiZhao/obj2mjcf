@@ -108,6 +108,10 @@ class Args:
     """(mandi) if compile fails because of qhull error, remove the errored mesh from the MJCF file"""
     exclude_default: bool = False
     """(mandi) exclude default mesh from MJCF file"""
+    force_merge: bool = False
+    """(mandi) force merge all meshes into one mesh"""
+    add_block_mass: bool = False
+    """(mandi) add a dummy geom with mass 10 to the root body"""
 
 
 @dataclass
@@ -337,7 +341,7 @@ def process_obj(filename: Path, args: Args) -> None:
     logging.info("Processing OBJ file with trimesh")
     mesh = trimesh.load(
         filename,
-        split_object=True,
+        split_object=True, 
         group_material=True,
         process=False,
         # Note setting this to False is important. Without it, there are a lot of weird
@@ -351,16 +355,23 @@ def process_obj(filename: Path, args: Args) -> None:
         logging.info(f"Saving mesh {savename}")
         mesh.export(savename, include_texture=True, header=None)
     else:
-        logging.info("Grouping and saving submeshes by material")
-        for i, geom in enumerate(mesh.geometry.values()):
-            savename = str(work_dir / f"{filename.stem}_{i}.obj")
-            logging.info(f"Saving submesh {savename}")
-            geom.export(savename, include_texture=True, header=None)
+        if args.force_merge:
+            logging.info("Merging all submeshes into one mesh")
+            concat = trimesh.util.concatenate(mesh.geometry.values())
+            savename = str(work_dir / f"{filename.stem}.obj")
+            concat.export(savename, include_texture=True, header=None)
+            mesh = concat 
+        else:
+            logging.info("Grouping and saving submeshes by material")
+            for i, geom in enumerate(mesh.geometry.values()):
+                savename = str(work_dir / f"{filename.stem}_{i}.obj")
+                logging.info(f"Saving submesh {savename}")
+                geom.export(savename, include_texture=True, header=None)
 
     # Edge case handling where the material file can have many materials but the OBJ
     # itself only references one. In that case, we trim out the extra materials and
     # only keep the one that is referenced.
-    if isinstance(mesh, trimesh.base.Trimesh) and len(mtls) > 1:
+    if isinstance(mesh, trimesh.base.Trimesh) and len(mtls) > 1 and not args.force_merge:
         # Find the material that is referenced.
         with open(filename, "r") as f:
             lines = f.readlines()
@@ -425,6 +436,7 @@ def process_obj(filename: Path, args: Args) -> None:
             type="mesh",
             contype="0",
             conaffinity="0",
+            mass="0", # (mandi) set mass to 0 to handle the 'volume too small' error
         )
         collision_default_elem = etree.SubElement(default_elem, "default")
         collision_default_elem.attrib["class"] = "collision"
@@ -466,6 +478,8 @@ def process_obj(filename: Path, args: Args) -> None:
     obj_body = etree.SubElement(worldbody_elem, "body", name=filename.stem)
     if args.add_free_joint:
         etree.SubElement(obj_body, "freejoint")
+    if args.add_block_mass:
+        etree.SubElement(obj_body, "geom", mass="10", rgba="1 0 0 0", name="dummy", type="box", size="0.01 0.01 0.01")
 
     # Add visual geoms.
     if isinstance(mesh, trimesh.base.Trimesh):
@@ -492,10 +506,12 @@ def process_obj(filename: Path, args: Args) -> None:
                 mujoco.mj_step(model, data)
                 cprint(f"{filename} compiled successfully!", "green")
             except Exception as e:
-                cprint(f"Error compiling model: {e} - Removing it from BOTH xml and its obj file", "red")
+                cprint(f"Error compiling model after adding {meshname.stem}: {e} - Removing it from BOTH xml and its obj file", "red")
+                # print(tmp_path)
+                # breakpoint()
                 # remove this mesh from root 
                 asset_elem.remove(mesh_asset)
-                print('removing! ', e_)
+                # print('removing! ', e_)
                 obj_body.remove(e_)
                 # remove this mesh's obj file
                 os.remove(work_dir / meshname)
@@ -530,7 +546,7 @@ def process_obj(filename: Path, args: Args) -> None:
                     mujoco.mj_step(model, data)
                     cprint(f"{filename} compiled successfully!", "green")
                 except Exception as e:
-                    cprint(f"Error compiling model: {e} - Removing it from BOTH xml and its obj file", "red")
+                    cprint(f"Error compiling model after adding {meshname}: {e} - Removing it from BOTH xml and its obj file", "red")
                     # remove this mesh from root 
                     asset_elem.remove(asset_i)
                     obj_body.remove(e_)
@@ -570,7 +586,7 @@ def process_obj(filename: Path, args: Args) -> None:
                     mujoco.mj_step(model, data)
                     cprint(f"{filename} compiled successfully!", "green")
                 except Exception as e:
-                    cprint(f"Error compiling model: {e}", "red")
+                    cprint(f"Error compiling model after adding collision mesh {meshname.stem}: {e} - Removing it", "yellow")
                     # remove this mesh from root 
                     obj_body.remove(e_)
                 finally:
@@ -593,7 +609,7 @@ def process_obj(filename: Path, args: Args) -> None:
                         mujoco.mj_step(model, data)
                         cprint(f"{filename} compiled successfully!", "green")
                     except Exception as e:
-                        cprint(f"Error compiling model: {e}", "red")
+                        cprint(f"Error compiling model after adding collision for {meshname.stem}: {e}", "yellow")
                         # remove this mesh from root 
                         obj_body.remove(e_)
                     finally:
@@ -614,7 +630,7 @@ def process_obj(filename: Path, args: Args) -> None:
             mujoco.mj_step(model, data)
             cprint(f"{filename} compiled successfully!", "green")
         except Exception as e:
-            cprint(f"Error compiling model: {e}", "red")
+            cprint(f"Error compiling the final model: {e}", "red")
         finally:
             if tmp_path.exists():
                 tmp_path.unlink()
